@@ -9,8 +9,8 @@ final class TripRecorder: NSObject, ObservableObject {
     // Live values the UI reads while recording.
     @Published var isRecording = false
     @Published var speedMph: Double = 0
-    @Published var accelMagnitude: Double = 0   // in g
-    @Published var carTurnRate: Double = 0      // deg/s — the CAR's turn rate from GPS course, not the phone's
+    @Published var accelMagnitude: Double = 0   // in g — smoothed horizontal (driving-plane) acceleration
+    @Published var carTurnRate: Double = 0      // deg/s — how fast the CAR's course over the ground is changing
     @Published var harshEvents: Int = 0
     @Published var statusMessage = "Idle"
 
@@ -29,7 +29,17 @@ final class TripRecorder: NSObject, ObservableObject {
     private let harshThreshold = 0.45            // g: an event must peak at/above this to count
     private let releaseThreshold = 0.25          // g: the event ends once we settle back below this
     private let severeThreshold = 0.65           // g: a peak at/above this is "severe", not just "harsh"
-    private let corneringRotationThreshold = 0.9 // rad/s: strong rotation ⇒ label the event as cornering
+    private let corneringTurnThreshold = 18.0    // deg/s of car yaw ⇒ label the event as cornering
+    private let minDrivingSpeedMph = 5.0         // below this, an accel spike is phone-handling, not driving
+
+    // The live dashboard readouts (g-force, turn rate) are smoothed with an
+    // exponential moving average so they read steady instead of flickering at the
+    // 20 Hz sensor rate. Detection still runs on the *raw* peaks (see ingestMotion),
+    // so a genuine spike is never smoothed away — only the on-screen number is calm.
+    private let displaySmoothing = 0.25          // EMA factor for g-force (0 = frozen, 1 = no smoothing)
+    private let turnSmoothing = 0.5              // EMA factor for turn rate (applied at the ~1 Hz fix rate)
+    private let speedDeadbandMph = 1.5           // below this the filtered speed is GPS noise ⇒ show a clean 0
+    private let maxPlausibleTurnRate = 90.0      // deg/s: above this it's a GPS course glitch, not a car
 
     private let locationManager = CLLocationManager()
     private let motionManager = CMMotionManager()
@@ -47,10 +57,22 @@ final class TripRecorder: NSObject, ObservableObject {
     private var peakAccelMagSinceLastFix: Double = 0   // g (horizontal); drives adaptive smoothing
     private var motionAvailable = false
 
+    // Smoothed dashboard readouts (see `displaySmoothing` / `turnSmoothing`).
+    private var accelDisplayEMA: Double = 0      // g
+    private var turnDisplayEMA: Double = 0       // deg/s
+
+    // Car heading tracking, for turn rate. Derived from the car's course over the
+    // ground, so rotating the phone inside the car has no effect on it.
+    private var lastCourse: Double?              // previous course, degrees
+    private var lastCourseTime: Date?
+
+    /// Every GPS fix of the trip, for the route map / road matching (Step 5).
+    private var routePoints: [RoutePoint] = []
+
     // Harsh-event detector state (hysteresis + peak hold).
     private var inEvent = false
     private var eventPeakG: Double = 0
-    private var eventPeakRotation: Double = 0
+    private var eventPeakTurnRate: Double = 0
 
     init(store: TripStore) {
         self.store = store
@@ -76,9 +98,15 @@ final class TripRecorder: NSObject, ObservableObject {
         lastLocation = nil
         speedFilter.reset()
         peakAccelMagSinceLastFix = 0
+        carTurnRate = 0
+        accelDisplayEMA = 0
+        turnDisplayEMA = 0
+        lastCourse = nil
+        lastCourseTime = nil
+        routePoints = []
         inEvent = false
         eventPeakG = 0
-        eventPeakRotation = 0
+        eventPeakTurnRate = 0
         harshEvents = 0
         speedMph = 0
         finishedTrip = nil
@@ -110,7 +138,7 @@ final class TripRecorder: NSObject, ObservableObject {
 
         // Flush an event that was still in progress when the user hit Stop.
         if inEvent {
-            recordedEvents.append(makeEvent(peakG: eventPeakG, peakRotation: eventPeakRotation))
+            recordedEvents.append(makeEvent(peakG: eventPeakG, peakTurnRate: eventPeakTurnRate))
             inEvent = false
         }
 
@@ -125,7 +153,8 @@ final class TripRecorder: NSObject, ObservableObject {
             events: recordedEvents,
             score: TripScorer.score(events: recordedEvents,
                                     distanceMiles: distanceMiles,
-                                    duration: end.timeIntervalSince(start))
+                                    duration: end.timeIntervalSince(start)),
+            route: routePoints
         )
         store.add(trip)
         finishedTrip = trip
@@ -144,60 +173,131 @@ final class TripRecorder: NSObject, ObservableObject {
         motionManager.deviceMotionUpdateInterval = 1.0 / 20.0   // 20 Hz
         motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
             guard let self, let motion else { return }
-            // Detect on *horizontal* acceleration only. The phone's orientation in
-            // the car is unknown, but `gravity` always points down, so we project
-            // userAcceleration onto it to get the vertical part and subtract it.
-            // Speed bumps and potholes live in that vertical axis — excluding it
-            // stops them from counting as harsh events.
-            let a = motion.userAcceleration
-            let g = motion.gravity
+            // The phone's orientation in the car is unknown, but `gravity` always
+            // points down, so we use it as our reference for both signals below.
+            let a = motion.userAcceleration          // linear acceleration, in g
+            let g = motion.gravity                   // gravity direction, in g (unit-ish)
             let gMag = sqrt(g.x * g.x + g.y * g.y + g.z * g.z)
+
+            // Detect on *horizontal* (driving-plane) acceleration only. Project
+            // userAcceleration onto gravity to get the vertical part and subtract
+            // it, so speed bumps/potholes (a vertical jolt) don't register.
             let vertical = gMag > 0 ? (a.x * g.x + a.y * g.y + a.z * g.z) / gMag : 0
             let totalSq = a.x * a.x + a.y * a.y + a.z * a.z
             let horizontal = totalSq > vertical * vertical ? sqrt(totalSq - vertical * vertical) : 0
-            let r = motion.rotationRate
-            let rot = sqrt(r.x * r.x + r.y * r.y + r.z * r.z)
-            // Hop to main so all detector/accumulator state stays single-threaded.
-            DispatchQueue.main.async { self.ingestMotion(magnitude: horizontal, rotation: rot) }
+
+            // NOTE: the gyroscope is deliberately NOT used for turn rate. It measures
+            // the *phone* rotating, which is not the same as the car turning — a phone
+            // sliding in a cupholder during a hard brake would read as a big yaw and
+            // mislabel that brake as cornering. Turn rate comes from the car's course
+            // over the ground instead (see `ingestLocation`).
+            DispatchQueue.main.async { self.ingestMotion(horizontalG: horizontal) }
         }
     }
 
-    /// Runs on the main thread. Drives the harsh-event state machine:
-    /// an event opens when magnitude crosses `harshThreshold`, holds the peak
-    /// while it stays elevated, and closes — emitting exactly one `DriveEvent` —
-    /// once magnitude settles back below `releaseThreshold`.
-    private func ingestMotion(magnitude mag: Double, rotation rot: Double) {
-        accelMagnitude = mag
-        rotationRate = rot
-        peakAccelMagSinceLastFix = max(peakAccelMagSinceLastFix, mag)
+    /// Runs on the main thread at the 20 Hz sensor rate. Smooths the live readouts
+    /// for the dashboard and drives the harsh-event state machine on the *raw* peaks:
+    /// an event opens when the raw horizontal g crosses `harshThreshold`, holds the
+    /// peak while it stays elevated, and closes — emitting exactly one `DriveEvent` —
+    /// once it settles back below `releaseThreshold`.
+    private func ingestMotion(horizontalG rawG: Double) {
+        let drivingNow = speedMph >= minDrivingSpeedMph
+
+        // Smoothed value feeds the UI; raw peaks feed the detector below.
+        accelDisplayEMA += displaySmoothing * (rawG - accelDisplayEMA)
+        accelMagnitude = accelDisplayEMA
+
+        peakAccelMagSinceLastFix = max(peakAccelMagSinceLastFix, rawG)
         guard isRecording else { return }
 
         if !inEvent {
-            if mag >= harshThreshold {
+            // Only open an event while actually driving — below ~5 mph an accel
+            // spike is the phone being handled, not the car.
+            if rawG >= harshThreshold, drivingNow {
                 inEvent = true
-                eventPeakG = mag
-                eventPeakRotation = rot
+                eventPeakG = rawG
+                eventPeakTurnRate = carTurnRate
             }
         } else {
-            eventPeakG = max(eventPeakG, mag)
-            eventPeakRotation = max(eventPeakRotation, rot)
-            if mag < releaseThreshold {
-                let event = makeEvent(peakG: eventPeakG, peakRotation: eventPeakRotation)
+            eventPeakG = max(eventPeakG, rawG)
+            eventPeakTurnRate = max(eventPeakTurnRate, carTurnRate)
+            if rawG < releaseThreshold {
+                let event = makeEvent(peakG: eventPeakG, peakTurnRate: eventPeakTurnRate)
                 recordedEvents.append(event)
                 harshEvents = recordedEvents.count
                 inEvent = false
                 eventPeakG = 0
-                eventPeakRotation = 0
-                print(String(format: "⚡️ %@ (%@) — peak %.2f g",
-                             event.kind.label, event.severity.label, event.peakG))
+                eventPeakTurnRate = 0
+                print(String(format: "⚡️ %@ (%@) — peak %.2f g, turn %.0f°/s",
+                             event.kind.label, event.severity.label, event.peakG, event.peakRotation))
             }
         }
     }
 
-    private func makeEvent(peakG: Double, peakRotation: Double) -> DriveEvent {
+    private func makeEvent(peakG: Double, peakTurnRate: Double) -> DriveEvent {
         let severity: EventSeverity = peakG >= severeThreshold ? .severe : .harsh
-        let kind: DriveEventKind = peakRotation >= corneringRotationThreshold ? .hardCornering : .hardBrakingOrAccel
-        return DriveEvent(kind: kind, severity: severity, peakG: peakG, peakRotation: peakRotation)
+        let kind: DriveEventKind = peakTurnRate >= corneringTurnThreshold ? .hardCornering : .hardBrakingOrAccel
+        return DriveEvent(kind: kind, severity: severity, peakG: peakG, peakRotation: peakTurnRate)
+    }
+
+    /// Car turn rate, in deg/s, from how fast its *course over the ground* is
+    /// changing. This is a property of the car's path, so rotating the phone inside
+    /// the car cannot affect it — unlike the gyroscope, which measures the phone.
+    ///
+    /// Course is only meaningful while moving, so below `minDrivingSpeedMph` we
+    /// decay toward zero and drop the reference heading (rather than snapping to 0
+    /// and differencing against a stale heading when we move off again, which is
+    /// what made the old version read 0°/s almost always).
+    private func updateTurnRate(for loc: CLLocation, speedMph mph: Double) {
+        guard mph >= minDrivingSpeedMph, let course = courseDegrees(for: loc) else {
+            turnDisplayEMA *= 0.5
+            carTurnRate = turnDisplayEMA
+            lastCourse = nil
+            lastCourseTime = nil
+            return
+        }
+
+        if let prev = lastCourse, let prevTime = lastCourseTime {
+            let dt = loc.timestamp.timeIntervalSince(prevTime)
+            // Reject implausible jumps — a real car tops out well under 90°/s, so
+            // anything above that is a GPS course glitch, not a maneuver.
+            if dt > 0.05 {
+                let rate = abs(TripRecorder.angularDifferenceDegrees(course, prev)) / dt
+                if rate <= maxPlausibleTurnRate {
+                    turnDisplayEMA += turnSmoothing * (rate - turnDisplayEMA)
+                }
+            }
+        }
+        carTurnRate = turnDisplayEMA
+        lastCourse = course
+        lastCourseTime = loc.timestamp
+    }
+
+    /// The car's heading: the GPS Doppler course when it's valid, otherwise the
+    /// bearing between this fix and the previous one.
+    private func courseDegrees(for loc: CLLocation) -> Double? {
+        if loc.course >= 0, loc.courseAccuracy >= 0 { return loc.course }
+        guard let last = lastLocation, loc.distance(from: last) >= 5 else { return nil }
+        return TripRecorder.bearingDegrees(from: last.coordinate, to: loc.coordinate)
+    }
+
+    /// Smallest signed angle from `b` to `a` in degrees, handling 0/360 wraparound.
+    private static func angularDifferenceDegrees(_ a: Double, _ b: Double) -> Double {
+        var d = (a - b).truncatingRemainder(dividingBy: 360)
+        if d > 180 { d -= 360 } else if d < -180 { d += 360 }
+        return d
+    }
+
+    /// Initial great-circle bearing from `a` to `b`, in degrees (0–360).
+    private static func bearingDegrees(from a: CLLocationCoordinate2D,
+                                       to b: CLLocationCoordinate2D) -> Double {
+        let lat1 = a.latitude * .pi / 180
+        let lat2 = b.latitude * .pi / 180
+        let dLon = (b.longitude - a.longitude) * .pi / 180
+        let y = sin(dLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        let deg = atan2(y, x) * 180 / .pi
+        return deg < 0 ? deg + 360 : deg
     }
 }
 
@@ -254,8 +354,13 @@ extension TripRecorder: CLLocationManagerDelegate {
 
         let filtered = speedFilter.update(measurement: measurement, variance: variance,
                                           dt: dt, accelerationNoise: processNoise)
-        let mph = max(0, filtered) * 2.23694
+        // Below a walking pace the filtered residual is GPS noise, not real motion,
+        // so show a clean 0 instead of a phantom "3 mph" while parked at a light.
+        let filteredMph = max(0, filtered) * 2.23694
+        let mph = filteredMph < speedDeadbandMph ? 0 : filteredMph
         speedMph = mph
+
+        updateTurnRate(for: loc, speedMph: mph)
 
         if isRecording {
             topSpeedMph = max(topSpeedMph, mph)
@@ -264,6 +369,13 @@ extension TripRecorder: CLLocationManagerDelegate {
                 // Drop GPS "teleport" glitches; otherwise accumulate trip distance.
                 if step.isFinite, step < 1000 { distanceMeters += step }
             }
+            // Keep the breadcrumb trail: it drives the route map, and road matching
+            // / speed limits are batch lookups over this trail after the trip ends.
+            routePoints.append(RoutePoint(latitude: loc.coordinate.latitude,
+                                          longitude: loc.coordinate.longitude,
+                                          timestamp: loc.timestamp,
+                                          speedMph: mph,
+                                          horizontalAccuracy: loc.horizontalAccuracy))
         }
         lastLocation = loc
         print(String(format: "📍 acc=%.0fm sAcc=%.1f  raw=%.1f  filtered=%.1f mph",

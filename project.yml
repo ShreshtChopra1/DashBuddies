@@ -1,0 +1,37 @@
+name: DashBuddies
+options:
+  bundleIdPrefix: com.dashbuddies
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  DashBuddies:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: DashBuddies
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocationWhenInUseUsageDescription: "DashBuddies records your trips and maps your route."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "DashBuddies records trips in the background so you don't have to open the app every drive."
+        NSMotionUsageDescription: "DashBuddies uses motion sensors to measure braking, acceleration, and cornering."
+        NSAppleMusicUsageDescription: "DashBuddies shows what's playing and lets you control Apple Music while you drive."
+        UIBackgroundModes:
+          - location
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dashbuddies.app
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: 1
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "5.0"
+        # No app icon yet — the catalog only holds the in-app logo. (The logo PNG
+        # has alpha and isn't square, so it can't be a marketing icon as-is.)
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""

@@ -1,0 +1,14 @@
+# Xcode / XcodeGen
+*.xcodeproj
+xcuserdata/
+DerivedData/
+build/
+Generated/
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# 3D models - large and not redistributable
+Sources/Models/*.usdz

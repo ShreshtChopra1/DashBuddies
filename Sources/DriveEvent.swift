@@ -4,8 +4,9 @@ import Foundation
 ///
 /// The phone's orientation in the car is unknown (see CLAUDE.md), so we can't
 /// yet tell braking from acceleration — both are longitudinal g-force. We *can*
-/// separate turning, since hard cornering shows up as strong rotation on the
-/// gyroscope. Splitting brake vs. accel needs the axis-calibration step.
+/// separate turning, since hard cornering shows up as a fast change in the car's
+/// course over the ground (GPS-derived, so it's immune to the phone being rotated
+/// inside the car). Splitting brake vs. accel needs the axis-calibration step.
 enum DriveEventKind: String, Codable {
     case hardBrakingOrAccel
     case hardCornering
@@ -55,8 +56,8 @@ struct DriveEvent: Identifiable, Codable {
     let timestamp: Date
     let kind: DriveEventKind
     let severity: EventSeverity
-    let peakG: Double          // peak linear-acceleration magnitude during the event, in g
-    let peakRotation: Double   // peak rotation-rate magnitude during the event, rad/s
+    let peakG: Double          // peak horizontal linear-acceleration magnitude during the event, in g
+    let peakRotation: Double   // peak car yaw rate during the event, deg/s
 
     init(id: UUID = UUID(),
          timestamp: Date = Date(),

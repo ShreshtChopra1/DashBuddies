@@ -56,7 +56,7 @@ struct TripRecordingView: View {
 
             HStack(spacing: 12) {
                 tile("bolt.fill", "G-force", String(format: "%.2f g", recorder.accelMagnitude))
-                tile("arrow.triangle.turn.up.right.diamond.fill", "Rotation", String(format: "%.2f", recorder.rotationRate))
+                tile("arrow.triangle.turn.up.right.diamond.fill", "Turn rate", String(format: "%.0f°/s", recorder.carTurnRate))
                 tile("exclamationmark.triangle.fill", "Harsh", "\(recorder.harshEvents)")
             }
 
